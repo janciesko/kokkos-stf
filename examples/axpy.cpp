@@ -16,32 +16,52 @@
  */
 
 #include <cuda/experimental/stf.cuh>
+#include <Kokkos_Core.hpp>
 
 using namespace cuda::experimental::stf;
+typedef Kokkos::TeamPolicy<Kokkos::ExecutionSpace>::member_type member_type;
 
-__global__ void axpy(double a, slice<const double> x, slice<double> y)
+template <typename T>
+struct axpy{
+  T a;
+  Kokkos::View<const T> x;
+  Kokkos::View<T> y;
+
+  axpy(T a_, Kokkos::View<const T> x_, Kokkos::View<T> y_)):a(a_),x(x_),y(y_){}
+  
+  KOKKOS_FUNCTION void operator(member_type team)(){
+    T row_val = 0;
+    i = team.league_rank();
+    Kokkos::parallel_reduce(Kokkos::TeamThreadRange(team,x.extent(1))), [=](int i, int & row_val_local)
+    {
+     row_val_local += a * x(j);
+    }, row_val
+    );
+    team_member.team_barrier();
+    y(i) = row_val;
+  }    
+}
+
+void axpy_launch(auto s, double alpha, auto x_, auto y_)
 {
-  int tid      = blockIdx.x * blockDim.x + threadIdx.x;
-  int nthreads = gridDim.x * blockDim.x;
-
-  for (int i = tid; i < x.size(); i += nthreads)
-  {
-    y(i) += a * x(i);
-  }
+  auto x (x_);
+  auto y (y_);
+  Kokkos::parallel_for("spmv",Kokkos::TeamPolicy<> (x.extent(), 16),axpy{alpha,x,y});
 }
 
 double X0(int i)
 {
-  return sin((double) i);
+  return sin(std::static_cast<double>(i));
 }
 
 double Y0(int i)
 {
-  return cos((double) i);
+  return cos(std::static_cast<double>(i));
 }
 
 int main()
 {
+  Kokkos::initialize();
   context ctx;
   const size_t N = 16;
   double X[N], Y[N];
@@ -59,7 +79,7 @@ int main()
 
   /* Compute Y = Y + alpha X */
   ctx.task(lX.read(), lY.rw())->*[&](cudaStream_t s, auto dX, auto dY) {
-    axpy<<<16, 128, 0, s>>>(alpha, dX, dY);
+    axpy_launch(s, alpha, dx, dy);
   };
 
   ctx.finalize();
@@ -69,4 +89,6 @@ int main()
     assert(fabs(Y[i] - (Y0(i) + alpha * X0(i))) < 0.0001);
     assert(fabs(X[i] - X0(i)) < 0.0001);
   }
+
+  Kokkos::finalize();
 }
